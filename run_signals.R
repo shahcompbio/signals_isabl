@@ -1,3 +1,19 @@
+#' Read and Process Haplotype Files
+#'
+#' This function reads haplotype data from a list of file paths, applies optional filters, and formats the data for further analysis.
+#'
+#' @param paths A character vector of file paths to haplotype files. Each file is expected to contain columns such as `cell_id`, `chromosome`, `start`, `end`, `allele_id`, `hap_label`, and `readcount`.
+#' @param cols_to_keep A character vector of column names to keep from the input data. Default columns include `cell_id`, `chr`, `start`, `end`, `allele_id`, `hap_label`, and `readcount`.
+#' @param cell_ids A character vector of `cell_id`s to filter the data by. If `NULL`, no filtering by cell is applied. Default is `NULL`.
+#' @param bin_ids A character vector of bin IDs to filter the data by. Each bin ID should follow the format `chr_start_end`. If `NULL`, no filtering by bins is applied. Default is `NULL`.
+#' @param format_haplotypes Logical, if `TRUE` (default), the function converts the haplotype data into a wide format suitable for downstream analysis.
+#'
+#' @details 
+#' If `bin_ids` is provided, the function extracts the bin size from the first `bin_id`, which is expected to follow the format `chr_start_end`. It uses this bin size to adjust the start and end positions of the data before filtering by bin IDs. 
+#' If `format_haplotypes` is `TRUE`, the data is reshaped into wide format with separate columns for different alleles' read counts and a total count column is added.
+#'
+#' @return A `data.table` containing the processed haplotype data. The columns include `cell_id`, `chr`, `start`, `end`, `hap_label`, and read counts for each allele, among others.
+#'
 read_haplotypes_dlp <- function(paths,
                                 cols_to_keep = c("cell_id", "chr", "start", "end", "allele_id", "hap_label", "readcount"),
                                 cell_ids = NULL,
@@ -57,17 +73,47 @@ read_haplotypes_dlp <- function(paths,
   return(hapsdata)
 }
 
+#' Read and Process Copy Number Data
+#'
+#' This function reads copy number data from a list of file paths, applies optional filters based on cell metrics, and returns a filtered dataset.
+#'
+#' @param cnpaths A character vector of file paths to copy number data files. Each file should contain columns such as `cell_id`, `chr`, `start`, `end`, `map`, `copy`, and `state`.
+#' @param metricspaths A character vector of file paths to metrics data files. Metrics data is used for filtering cells based on quality and other criteria.
+#' @param sample_ids A character vector of sample IDs to associate with the metrics files. If `NULL`, no sample IDs are assigned. Default is `NULL`.
+#' @param filtercells Logical, if `TRUE` (default), cells are filtered based on quality and contamination criteria from the metrics data.
+#' @param cols_to_keep A character vector of column names to retain from the copy number data. Default columns include `cell_id`, `chr`, `start`, `end`, `map`, `copy`, and `state`.
+#' @param mappability A numeric threshold for filtering regions based on mappability. Only regions with mappability scores greater than this value are retained. Default is `0.99`.
+#' @param s_phase_filter Logical, if `TRUE`, cells in S-phase are filtered out. Default is `FALSE`.
+#' @param quality_filter A numeric threshold for filtering cells based on quality. Only cells with quality scores higher than this value are retained. Default is `0.75`.
+#' @param filter_reads A numeric threshold for filtering cells based on the total number of mapped reads. Default is `0`.
+#'
+#' @details 
+#' The function reads metrics data and applies several filtering criteria, including quality, contamination, and mappability. Cells that pass the filters are used to subset the copy number data. The final output includes both the filtered copy number data and the associated cell metrics.
+#'
+#' @return A list with two elements:
+#' \describe{
+#'   \item{cn}{A `data.frame` containing the filtered copy number data.}
+#'   \item{metrics}{A `data.frame` containing the filtered cell metrics.}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' # Example usage:
+#' result <- read_copynumber_dlp(cnpaths = c("cn_file1.csv", "cn_file2.csv"),
+#'                               metricspaths = c("metrics_file1.csv", "metrics_file2.csv"),
+#'                               sample_ids = c("sample1", "sample2"),
+#'                               filtercells = TRUE)
+#' }
+#'
 read_copynumber_dlp <- function(cnpaths,
                                 metricspaths,
                                 sample_ids = NULL,
-                                patient = NULL,
                                 filtercells = TRUE,
-                                filtertumorcells = FALSE,
                                 cols_to_keep = c("cell_id", "chr", "start", "end", "map", "copy", "state"),
                                 mappability = 0.99,
                                 s_phase_filter = FALSE,
                                 quality_filter = 0.75,
-                                filter_reads = 0.1e6){
+                                filter_reads = 0){
   
   metricslist <- list()
   i <- 1
@@ -92,7 +138,7 @@ read_copynumber_dlp <- function(cnpaths,
     cells_to_keep <- metricsdata %>%
       .[quality > quality_filter] %>%
       .[is_contaminated == FALSE] %>%
-      #.[total_mapped_reads > filter_reads] %>%
+      .[total_mapped_reads > filter_reads] %>%
       .[is_control == FALSE]
     
     if (s_phase_filter == TRUE){
@@ -129,7 +175,6 @@ read_copynumber_dlp <- function(cnpaths,
 
 read_copynumber_dlpqc <- function(metricspaths,
                                 sample_ids = NULL,
-                                patient = NULL,
                                 filtercells = TRUE,
                                 mappability = 0.99,
                                 s_phase_filter = FALSE,
@@ -241,7 +286,8 @@ callhscn <- function(cn,
                      global_phasing_for_balanced = FALSE,
                      chrs_for_global_phasing = NULL,
                      frachaps = 0.8,
-                     ncores = 1){
+                     ncores = 1,
+                     female = TRUE){
 
   cn <- as.data.table(cn)
   qc <- as.data.table(qc)
@@ -279,7 +325,8 @@ callhscn <- function(cn,
                                   likelihood = "auto",
                                   mincells = mincells,
                                   cluster_per_chr = TRUE, 
-                                  ncores = ncores)
+                                  ncores = ncores,
+                                  female = female)
   
   #add library and sample IDs to qc
   qc$sample_id <- unlist(signals:::get_library_labels(qc$cell_id, idx=1))
@@ -358,6 +405,12 @@ run_signals <- function(args){
     global_phasing_for_balanced <- FALSE
   }
   
+  if (args$sex == "FEMALE"){
+    female <- TRUE
+  } else{
+    female <- FALSE
+  }
+  
   message("Call haplotype specific copy number")
   res <- callhscn(cndata$cn,
                   cndata$metrics,
@@ -369,15 +422,16 @@ run_signals <- function(args){
                   ncores = args$ncores,
                   filternormalcells = args$filternormalcells,
                   chrs_for_global_phasing = chrs_for_global_phasing,
-                  global_phasing_for_balanced = global_phasing_for_balanced)
+                  global_phasing_for_balanced = global_phasing_for_balanced,
+                  female = female)
   res <- extra_qc_annotations(res)
   
   print(res)
   
-  message("Call allele specific copy number")
-  res2 <- callascn(res, ncores = args$ncores)
-  res2$likelihood <- res$likelihood
-  print(res2)
+  # message("Call allele specific copy number")
+  # res2 <- callascn(res, ncores = args$ncores)
+  # res2$likelihood <- res$likelihood
+  # print(res2)
   
   message("Make QC plots")
   g1 <- plotBAFperstate(res$data %>% filter(totalcounts > 9))+
@@ -473,7 +527,7 @@ run_signals <- function(args){
   fwrite(x = res$qc_per_cell, file = args$qccsvfile)
   
   message("Write Rdata file")
-  saveRDS(file = args$Rdatafile, object = list(hscn = res, ascn = res2, cl = cl))
+  saveRDS(file = args$Rdatafile, object = list(hscn = res, cl = cl))
   
   message("Make heatmaps")
   if (dim(cl$clustering)[1] > args$maxcellsplotting){
@@ -589,11 +643,13 @@ main <- function(){
                       help="HMMcopy style table with bins to be masked")
   parser$add_argument("--chrs_for_global_phasing", default=NULL, type="character",
                       help="Chromosomes to phase using global phasing for diploid regions")
+  parser$add_argument("--sex", default=NULL, type="character",
+                      help="Patient sex, either FEMALE or MALE, this controls what happens with chromosome X")
   args <- parser$parse_args()
   
   print(args)
   
-  #saveRDS(args, file = "args.rdata")
+  saveRDS(args, file = "args_male.rdata")
   
   run_signals(args)
 }
@@ -601,10 +657,10 @@ main <- function(){
 library(argparse)
 library(tidyverse)
 library(data.table)
-library(signals)
+#library(signals)
+devtools::load_all("/home/william1/bin/R/signals")
 library(ggplot2)
 library(cowplot)
 
 main()
 print(sessionInfo())
-
