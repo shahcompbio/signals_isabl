@@ -173,6 +173,23 @@ read_copynumber_dlp <- function(cnpaths,
   return(list(cn = cndata %>% as.data.frame(), metrics = metricsdata %>% as.data.frame()))
 }
 
+#' Read and Process Copy Number Quality Control (QC) Metrics
+#'
+#' This function reads cell-level QC metrics from a list of file paths, applies optional filters based on quality and other criteria, and returns the filtered metrics data.
+#'
+#' @param metricspaths A character vector of file paths to QC metrics files. Each file should contain columns such as `cell_id`, `quality`, `is_contaminated`, `is_s_phase`, and `is_control`.
+#' @param sample_ids A character vector of sample IDs to associate with the metrics files. If `NULL`, no sample IDs are assigned. Default is `NULL`.
+#' @param filtercells Logical, if `TRUE` (default), cells are filtered based on quality, contamination, and S-phase status from the metrics data.
+#' @param mappability A numeric threshold for filtering regions based on mappability. Not used in this function but kept for consistency. Default is `0.99`.
+#' @param s_phase_filter Logical, if `TRUE`, cells in S-phase are filtered out. Default is `FALSE`.
+#' @param quality_filter A numeric threshold for filtering cells based on quality. Only cells with quality scores higher than this value are retained. Default is `0.75`.
+#' @param filter_reads A numeric threshold for filtering cells based on the total number of mapped reads. Not currently used in this function. Default is `0`.
+#'
+#' @details 
+#' The function reads metrics data and applies several filtering criteria, including quality, contamination, and S-phase status. If `filtercells` is set to `TRUE`, the function filters out cells that do not meet these criteria.
+#'
+#' @return A `data.frame` containing the filtered metrics data.
+#'
 read_copynumber_dlpqc <- function(metricspaths,
                                 sample_ids = NULL,
                                 filtercells = TRUE,
@@ -205,7 +222,7 @@ read_copynumber_dlpqc <- function(metricspaths,
       .[quality > quality_filter] %>%
       .[is_contaminated == FALSE] %>%
       .[is_s_phase == FALSE] %>%
-      #.[total_mapped_reads > filter_reads] %>%
+      .[total_mapped_reads > filter_reads] %>%
       .[is_control == FALSE]
     
     if (s_phase_filter){
@@ -220,6 +237,27 @@ read_copynumber_dlpqc <- function(metricspaths,
   return(metrics = metricsdata %>% as.data.frame())
 }
 
+#' Filter Out Normal (Diploid) Cells
+#'
+#' This function filters out normal or diploid cells from copy number data, QC metrics, and haplotype data based on a specified threshold for non-diploid fractions and cell ploidy.
+#'
+#' @param cn A `data.table` containing copy number data. The table should have columns such as `cell_id` and `state`.
+#' @param qc A `data.frame` or `data.table` containing QC metrics for cells. It should have at least a `cell_id` column.
+#' @param haps A `data.table` containing haplotype data. It should also have a `cell_id` column for filtering purposes.
+#' @param diploidcutoff A numeric value representing the cutoff for filtering cells based on the fraction of non-diploid states. Cells with a fraction of non-diploid states greater than this value are retained. Default is `0.05`.
+#'
+#' @details
+#' The function computes the fraction of each cell that is diploid (state == 2) and filters cells based on the specified `diploidcutoff`. It calculates the fraction of the cell's genome in the most common state (ploidy), removes cells that are likely diploid or miscalled, and retains non-diploid cells for further analysis.
+#'
+#' If `diploidcutoff` is set to `0.0`, the function removes miscalled diploid cells where the most common state is greater than 2. Otherwise, it finds tumor cells by filtering out cells with a non-diploid fraction greater than the cutoff and a ploidy fraction below an outlier cutoff.
+#'
+#' @return A list with three elements:
+#' \describe{
+#'   \item{cn}{A filtered `data.table` containing the copy number data for non-diploid cells.}
+#'   \item{qc}{A `data.frame` containing QC metrics for non-diploid cells, with additional columns for ploidy cutoff and tumor cell identification.}
+#'   \item{haps}{A filtered `data.table` containing haplotype data for non-diploid cells.}
+#' }
+#'
 filter_normal_cells <- function(cn,
                                qc,
                                haps,
@@ -263,6 +301,24 @@ filter_normal_cells <- function(cn,
   return(list(cn = cn, qc = qc, haps = haps))
 }
 
+#' Identify Tumor Cells Based on Copy Number Data
+#'
+#' This function identifies tumor cells by clustering copy number data and calculating the fraction of non-diploid states for each cell. Cells with a non-diploid fraction above a specified cutoff are classified as tumor cells.
+#'
+#' @param cn A `data.table` containing copy number data. The table should include columns such as `cell_id` and `state` to assess diploidy.
+#' @param diploidcutoff A numeric value representing the cutoff for classifying a cell as a tumor cell based on its fraction of non-diploid states. Cells with a fraction of non-diploid states greater than this cutoff are classified as tumor cells. Default is `0.05`.
+#'
+#' @details
+#' The function performs clustering on the copy number data using UMAP and DBSCAN, then computes the consensus copy number states for each cluster. For each cell, it calculates the fraction of the genome that is not in the diploid state (state != 2). Cells with a non-diploid fraction greater than the `diploidcutoff` are marked as tumor cells.
+#'
+#' @return A `data.table` with the following columns:
+#' \describe{
+#'   \item{cell_id}{The identifier for each cell.}
+#'   \item{frac_nondiploid}{The fraction of the genome that is not in the diploid state for each cell.}
+#'   \item{tumor_clone_id_clustering}{The clone ID derived from UMAP clustering.}
+#'   \item{is_tumor_cell}{Logical indicating whether the cell is classified as a tumor cell (`TRUE`) or not (`FALSE`).}
+#' }
+#'
 find_tumor_cells <- function(cn, diploidcutoff = 0.05){
   cl <- umap_clustering(cn, field = "copy", minPts = 5, umapmetric = "correlation")
   cn_clones <- consensuscopynumber(cn, cl$clustering)
@@ -276,6 +332,31 @@ find_tumor_cells <- function(cn, diploidcutoff = 0.05){
   return(tumor_cell)
 }
 
+#' Call Haplotype-Specific Copy Number (HSCN)
+#'
+#' This function calls haplotype-specific copy number (HSCN) states from copy number data, quality control (QC) metrics, and haplotype data. It optionally filters out normal (diploid) cells before inferring HSCN states.
+#'
+#' @param cn A `data.table` containing copy number data. The table should have columns such as `cell_id`, `state`, `chr`, `start`, `end`.
+#' @param qc A `data.table` containing QC metrics for the cells, including `cell_id`.
+#' @param haps A `data.table` containing haplotype data, which also includes `cell_id`.
+#' @param diploidcutoff A numeric value representing the cutoff for classifying a cell as diploid based on its fraction of non-diploid states. Default is `0.05`.
+#' @param mincells The minimum number of cells required to infer HSCN states. Default is `8`.
+#' @param filternormalcells Logical, if `TRUE`, the function filters out normal (diploid) cells based on the `diploidcutoff`. Default is `FALSE`.
+#' @param maskedbins A character vector specifying bins to mask (exclude) from the analysis. Default is `NULL`.
+#' @param global_phasing_for_balanced Logical, if `TRUE`, global phasing (all cells) is applied for balanced chromosomes. Default is `FALSE`.
+#' @param chrs_for_global_phasing A character vector of chromosomes for which global phasing should be applied. Default is `NULL`.
+#' @param frachaps A numeric value specifying the fraction of haplotypes to consider. Default is `0.8`.
+#' @param ncores The number of cores to use for parallel processing. Default is `1`.
+#' @param female Logical, indicating whether the sample is female, which affects chromosome X analyses. Default is `TRUE`.
+#'
+#' @details
+#' The function first checks if normal (diploid) cells should be filtered using the `find_tumor_cells` function. 
+#' If normal cells are filtered, the copy number, QC, and haplotype data are restricted to tumor cells.
+#' The function then calls haplotype-specific copy number states using the `callHaplotypeSpecificCN` function. 
+#' If fewer than 10 cells remain after filtering, the function returns an error. If valid data exist, the HSCN results are returned, including updated QC information.
+#'
+#' @return A list containing HSCN data, including the inferred copy number states, and the updated QC metrics (`qc_per_cell`).
+#'
 callhscn <- function(cn,
                      qc,
                      haps,
@@ -370,6 +451,40 @@ extra_qc_annotations <- function(res){
   return(res)
 }
 
+
+#' Run the SIGNALS Pipeline for HSCN and QC Analysis
+#'
+#' This function executes the SIGNALS pipeline for haplotype-specific copy number (HSCN) analysis and quality control (QC) on copy number, QC, and haplotype data. It generates visualizations such as heatmaps and QC plots.
+#'
+#' @param args A list of arguments containing paths to the required data and additional parameters:
+#' - `hmmcopyreads`: Path(s) to the copy number data files.
+#' - `hmmcopyqc`: Path(s) to the QC metrics files.
+#' - `allelecounts`: Path to the allele counts (haplotype) data.
+#' - `cell_list`: Optional, path to a file containing a list of cell IDs to retain.
+#' - `maskbins`: Optional, path to a file with masked bins (excluded from the analysis).
+#' - `chrs_for_global_phasing`: Optional, a comma-separated string of chromosomes for global phasing.
+#' - `sex`: String indicating the sex of the sample ("MALE" or "FEMALE").
+#' - `mincells`: Minimum number of cells required for HSCN analysis.
+#' - `diploidcutoff`: Cutoff for defining diploid cells based on non-diploid fractions.
+#' - `ncores`: Number of cores to use for parallel processing.
+#' - `filternormalcells`: Logical, if `TRUE`, filters normal (diploid) cells before HSCN analysis.
+#' - `qcplot`: File path to save the generated QC plots.
+#' - `csvfile`: File path to save the resulting HSCN data as a CSV file.
+#' - `qccsvfile`: File path to save the QC data as a CSV file.
+#' - `Rdatafile`: File path to save the full results as an RDS file.
+#' - `heatmap`: File path to save the HSCN heatmap.
+#' - `heatmapraw`: File path to save the raw copy and BAF heatmaps.
+#' - `maxcellsplotting`: Maximum number of cells to plot in heatmaps.
+#'
+#' @details
+#' The function begins by reading in copy number data, QC metrics, and haplotype data, optionally filtering the cell list and applying masking of bins. 
+#' It then calls haplotype-specific copy number (HSCN) using the `callhscn` function, applies QC filters, and generates various QC plots.
+#' The results, including inferred HSCN states and quality metrics, are saved in CSV and RDS formats. 
+#' Heatmaps showing cell clustering and HSCN states are generated and saved.
+#'
+#' @return
+#' The function does not return any values but saves the results and plots to the specified output files.
+#'
 run_signals <- function(args){
   
   cndata <- read_copynumber_dlp(cnpaths = args$hmmcopyreads,
@@ -377,6 +492,14 @@ run_signals <- function(args){
   cell_ids <- unique(cndata$metrics$cell_id)
   message(paste0("Number of cells: ", length(cell_ids)))
   message(paste0("Number of bins: ", dim(distinct(cndata$cn, chr, start))[1]))
+  
+  if (!is.null(args$cell_list)){
+    message(paste0("Filtering for cells in ", args$cell_list))
+    cell_list <- data.table::fread(args$cell_list, header = FALSE)
+    cndata$cn <- filter(cndata$cn, cell_id %in% cell_list$V1)
+    cndata$metrics <- filter(cndata$metrics, cell_id %in% cell_list$V1)
+    message(paste0("Number of cells: ", length(cell_ids)))
+  }
   
   bin_ids <- as.data.table(cndata$cn)[, c("chr", "start", "end")] %>%
     unique(., by = c("chr", "start", "end")) %>%
@@ -645,11 +768,12 @@ main <- function(){
                       help="Chromosomes to phase using global phasing for diploid regions")
   parser$add_argument("--sex", default=NULL, type="character",
                       help="Patient sex, either FEMALE or MALE, this controls what happens with chromosome X")
+  parser$add_argument("--cell_list", default=NULL, type="character",
+                      help="List of files in a text file, one cell_id per row, no header. Only use this subset of cells.")
   args <- parser$parse_args()
   
   print(args)
-  
-  saveRDS(args, file = "args_male.rdata")
+  #saveRDS(args, file = "args.rdata")
   
   run_signals(args)
 }
@@ -657,8 +781,8 @@ main <- function(){
 library(argparse)
 library(tidyverse)
 library(data.table)
-#library(signals)
-devtools::load_all("/home/william1/bin/R/signals")
+library(signals)
+#devtools::load_all("/home/william1/bin/R/signals")
 library(ggplot2)
 library(cowplot)
 

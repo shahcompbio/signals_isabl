@@ -7,6 +7,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 
+img="/data1/shahs3/users/william1/software/singularity/rstudio-docker_main.sif"
+
 singularity exec --bind=/data1 --bind=/home \
     /data1/shahs3/users/william1/software/singularity/rstudio-docker_main.sif \
     Rscript run_signals.R  \
