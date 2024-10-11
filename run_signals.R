@@ -766,7 +766,7 @@ main <- function(){
                       help="HMMcopy style table with bins to be masked")
   parser$add_argument("--chrs_for_global_phasing", default=NULL, type="character",
                       help="Chromosomes to phase using global phasing for diploid regions")
-  parser$add_argument("--sex", default=NULL, type="character",
+  parser$add_argument("--sex", default="FEMALE", type="character",
                       help="Patient sex, either FEMALE or MALE, this controls what happens with chromosome X")
   parser$add_argument("--cell_list", default=NULL, type="character",
                       help="List of files in a text file, one cell_id per row, no header. Only use this subset of cells.")

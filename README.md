@@ -22,6 +22,9 @@ singularity exec --bind=/data1 --bind=/home \
     --cell_list data/cell_list_128701A.txt
 ```
 
+### v0.2.1
+- Set default to "FEMALE"
+
 ### v0.2.0 
 For use with SIGNALS v0.11.0. Includes the following additions
 - `sex` parameter for specifying patient sex, this determines what happens with chrX.
