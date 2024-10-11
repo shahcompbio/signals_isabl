@@ -1,2 +1,4 @@
 results/*
 logs/*
+.Rproj.user
+test.R

@@ -28,3 +28,6 @@ For use with SIGNALS v0.11.0. Includes the following additions
 - `cell_list` only run for the set of cells listed in cell_list
 - No additional filtering beyond HMMcopy
 - Sets homozygous deletions to state 0|0
+
+[Docker for v.11.0](https://hub.docker.com/layers/marcjwilliams1/signals/v0.11.0/images/sha256-f6f076ecd505a76e3fb13e4f0607647fa4da6e262b0e09a05854fabaddfacd20?context=explore). 
+Path on iris: ``
