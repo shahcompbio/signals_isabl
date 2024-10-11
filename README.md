@@ -33,4 +33,4 @@ For use with SIGNALS v0.11.0. Includes the following additions
 - Sets homozygous deletions to state 0|0
 
 [Docker for v.11.0](https://hub.docker.com/layers/marcjwilliams1/signals/v0.11.0/images/sha256-f6f076ecd505a76e3fb13e4f0607647fa4da6e262b0e09a05854fabaddfacd20?context=explore). 
-Path on iris: ``
+Path on iris: `data1/shahs3/users/william1/software/singularity/signals_v0.11.0.sif`
