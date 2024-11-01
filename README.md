@@ -22,7 +22,7 @@ singularity exec --bind=/data1 --bind=/home \
     --cell_list data/cell_list_128701A.txt
 ```
 
-Docker file for latest signals is automatically pushed to [Dockerhub](https://hub.docker.com/layers/marcjwilliams1/signals).
+Docker file for latest signals is automatically pushed to [Dockerhub](https://hub.docker.com/r/marcjwilliams1/signals).
 
 ### v0.2.1
 - Set default to "FEMALE"
