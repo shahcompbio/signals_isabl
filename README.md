@@ -24,6 +24,10 @@ singularity exec --bind=/data1 --bind=/home \
 
 Docker file for latest signals is automatically pushed to [Dockerhub](https://hub.docker.com/r/marcjwilliams1/signals).
 
+### v0.3.0
+- Add option to use `chr_cell_list` in signals
+- Expose `selftransitionprob` as a parameter to the script
+
 ### v0.2.1
 - Set default to "FEMALE"
 - [Docker for v.11.2](https://hub.docker.com/layers/marcjwilliams1/signals/v0.11.2/images/sha256-db091dd55ae5851471e297a6637b045d74bfe318d760c3656437d16bad4d63f2?context=explore). 

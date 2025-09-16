@@ -367,6 +367,8 @@ callhscn <- function(cn,
                      global_phasing_for_balanced = FALSE,
                      chrs_for_global_phasing = NULL,
                      frachaps = 0.8,
+                     selftransitionprob = 0.95,
+                     chr_cell_list = NULL,
                      ncores = 1,
                      female = TRUE){
 
@@ -403,9 +405,11 @@ callhscn <- function(cn,
                                   maskedbins = maskedbins,
                                   chrs_for_global_phasing = chrs_for_global_phasing,
                                   global_phasing_for_balanced = global_phasing_for_balanced,
+                                  selftransitionprob = selftransitionprob,
                                   likelihood = "auto",
                                   mincells = mincells,
                                   cluster_per_chr = TRUE, 
+                                  chr_cell_list = chr_cell_list,
                                   ncores = ncores,
                                   female = female)
   
@@ -534,6 +538,38 @@ run_signals <- function(args){
     female <- FALSE
   }
   
+  message("Process chr_cell_list if provided")
+  chr_cell_list_processed <- NULL
+  if (!is.null(args$chr_cell_list)){
+    message(paste0("Reading chr_cell_list from: ", args$chr_cell_list))
+    chr_cell_df <- data.table::fread(args$chr_cell_list)
+    
+    # Check if required columns exist
+    if (!all(c("chr", "cell_id") %in% colnames(chr_cell_df))){
+      stop("chr_cell_list file must contain columns 'chr' and 'cell_id'")
+    }
+    
+    # Get unique chromosomes from CN data
+    cn_chromosomes <- unique(cndata$cn$chr)
+    chr_cell_chromosomes <- unique(chr_cell_df$chr)
+    
+    # Check if chromosomes in chr_cell_list match those in CN data
+    missing_in_cn <- setdiff(chr_cell_chromosomes, cn_chromosomes)
+    if (length(missing_in_cn) > 0){
+      stop(paste0("Chromosomes in chr_cell_list not found in CN data: ", paste(missing_in_cn, collapse = ", ")))
+    }
+    
+    # Convert to named list format required by callHaplotypeSpecificCN
+    chr_cell_list_processed <- split(chr_cell_df$cell_id, chr_cell_df$chr)
+    # Convert to character names as expected by signals
+    names(chr_cell_list_processed) <- as.character(names(chr_cell_list_processed))
+    
+    message(paste0("Processed chr_cell_list for ", length(chr_cell_list_processed), " chromosomes"))
+    for (chr in names(chr_cell_list_processed)){
+      message(paste0("  Chr ", chr, ": ", length(chr_cell_list_processed[[chr]]), " cells"))
+    }
+  }
+  
   message("Call haplotype specific copy number")
   res <- callhscn(cndata$cn,
                   cndata$metrics,
@@ -546,6 +582,8 @@ run_signals <- function(args){
                   filternormalcells = args$filternormalcells,
                   chrs_for_global_phasing = chrs_for_global_phasing,
                   global_phasing_for_balanced = global_phasing_for_balanced,
+                  selftransitionprob = args$selftransitionprob,
+                  chr_cell_list = chr_cell_list_processed,
                   female = female)
   res <- extra_qc_annotations(res)
   
@@ -762,8 +800,12 @@ main <- function(){
                       help="Max number of cells to plot in the heatmap")
   parser$add_argument("--mincells", default=8, type="integer",
                       help="Min number of cells for per chromosome clustering")
+  parser$add_argument("--selftransitionprob", default=0.95, type="double",
+                      help="Self transition probability for HMM")
   parser$add_argument("--maskbins", default=NULL, type="character",
                       help="HMMcopy style table with bins to be masked")
+  parser$add_argument("--chr_cell_list", default=NULL, type="character",
+                      help="List cells to use for phasing for each chromosome, needs to be the path to a csv with two columns, chr and cell_id")
   parser$add_argument("--chrs_for_global_phasing", default=NULL, type="character",
                       help="Chromosomes to phase using global phasing for diploid regions")
   parser$add_argument("--sex", default="FEMALE", type="character",
