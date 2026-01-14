@@ -2,3 +2,5 @@ results/*
 logs/*
 .Rproj.user
 test.R
+jobscript_*
+jobscript2.sh

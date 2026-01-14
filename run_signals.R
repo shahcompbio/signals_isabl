@@ -811,7 +811,7 @@ main <- function(){
   parser$add_argument("--sex", default="FEMALE", type="character",
                       help="Patient sex, either FEMALE or MALE, this controls what happens with chromosome X")
   parser$add_argument("--cell_list", default=NULL, type="character",
-                      help="List of files in a text file, one cell_id per row, no header. Only use this subset of cells.")
+                      help="List of cells in a text file, one cell_id per row, no header. Only use this subset of cells.")
   args <- parser$parse_args()
   
   print(args)
