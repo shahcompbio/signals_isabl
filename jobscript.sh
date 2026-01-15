@@ -11,7 +11,7 @@ img="/data1/shahs3/users/william1/software/singularity/rstudio-docker_main.sif"
 
 singularity exec --bind=/data1 --bind=/home \
     /data1/shahs3/users/william1/software/singularity/rstudio-docker_main.sif \
-    Rscript run_signals.R  \
+    Rscript --vanilla run_signals.R \
     --hmmcopyqc /data1/shahs3/isabl_data_lake/analyses/18/69/31869/results/SHAH_H000708_T05_01_DLP01_hmmcopy_metrics.csv.gz /data1/shahs3/isabl_data_lake/analyses/19/36/31936/results/SHAH_H000708_T03_05_DLP01_hmmcopy_metrics.csv.gz \
     --hmmcopyreads /data1/shahs3/isabl_data_lake/analyses/18/69/31869/results/SHAH_H000708_T05_01_DLP01_hmmcopy_reads.csv.gz /data1/shahs3/isabl_data_lake/analyses/19/36/31936/results/SHAH_H000708_T03_05_DLP01_hmmcopy_reads.csv.gz \
     --allelecounts /data1/shahs3/isabl_data_lake/analyses/95/33/29533/results/haplotype_calling_count.csv.gz /data1/shahs3/isabl_data_lake/analyses/05/61/30561/results/haplotype_calling_count.csv.gz \
