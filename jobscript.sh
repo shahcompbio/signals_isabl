@@ -21,6 +21,6 @@ singularity exec --bind=/data1 --bind=/home \
     --heatmapraw results/OV-107/heatmapraw.png \
     --csvfile results/OV-107/hscn.csv.gz \
     --qccsvfile results/OV-107/qc.csv \
-    --Rdatafile results/OV-107/schnapps.Rdata
+    --Rdatafile results/OV-107/signals.Rdata
 
 #singularity shell --bind=/juno --bind=/home /juno//work/shah/users/william1/singularity//schnapps_v0.5.4.sif
