@@ -82,7 +82,7 @@ read_haplotypes_dlp <- function(paths,
 #' @param sample_ids A character vector of sample IDs to associate with the metrics files. If `NULL`, no sample IDs are assigned. Default is `NULL`.
 #' @param filtercells Logical, if `TRUE` (default), cells are filtered based on quality and contamination criteria from the metrics data.
 #' @param cols_to_keep A character vector of column names to retain from the copy number data. Default columns include `cell_id`, `chr`, `start`, `end`, `map`, `copy`, and `state`.
-#' @param mappability A numeric threshold for filtering regions based on mappability. Only regions with mappability scores greater than this value are retained. Default is `0.99`.
+#' @param mappability A numeric threshold for filtering regions based on mappability. Only regions with mappability scores greater than this value are retained. If `NULL`, no mappability filter is applied. Default is `NULL`.
 #' @param s_phase_filter Logical, if `TRUE`, cells in S-phase are filtered out. Default is `FALSE`.
 #' @param quality_filter A numeric threshold for filtering cells based on quality. Only cells with quality scores higher than this value are retained. Default is `0.75`.
 #' @param filter_reads A numeric threshold for filtering cells based on the total number of mapped reads. Default is `0`.
@@ -479,6 +479,7 @@ extra_qc_annotations <- function(res){
 #' - `heatmap`: File path to save the HSCN heatmap.
 #' - `heatmapraw`: File path to save the raw copy and BAF heatmaps.
 #' - `maxcellsplotting`: Maximum number of cells to plot in heatmaps.
+#' - `mappability`: Optional numeric threshold for filtering bins by mappability (only bins with map > this value are kept). Default `NULL` (no filter).
 #'
 #' @details
 #' The function begins by reading in copy number data, QC metrics, and haplotype data, optionally filtering the cell list and applying masking of bins. 
@@ -492,7 +493,8 @@ extra_qc_annotations <- function(res){
 run_signals <- function(args){
   
   cndata <- read_copynumber_dlp(cnpaths = args$hmmcopyreads,
-                                metricspaths = args$hmmcopyqc)
+                                metricspaths = args$hmmcopyqc,
+                                mappability = args$mappability)
   cell_ids <- unique(cndata$metrics$cell_id)
   message(paste0("Number of cells: ", length(cell_ids)))
   message(paste0("Number of bins: ", dim(distinct(cndata$cn, chr, start))[1]))
@@ -812,6 +814,8 @@ main <- function(){
                       help="Patient sex, either FEMALE or MALE, this controls what happens with chromosome X")
   parser$add_argument("--cell_list", default=NULL, type="character",
                       help="List of cells in a text file, one cell_id per row, no header. Only use this subset of cells.")
+  parser$add_argument("--mappability", default=NULL, type="double",
+                      help="Mappability threshold; only bins with map > this value are kept. Default NULL (no filter).")
   args <- parser$parse_args()
   
   print(args)
