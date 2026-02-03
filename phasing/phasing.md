@@ -235,3 +235,32 @@ plotCNprofileBAF(rdata_v2$hscn$data, cellid = chr11_cell, chrfilt = "11")
 ```
 
 ![](phasing_files/figure-commonmark/unnamed-chunk-17-1.png)
+
+## Heuristics for choosing cells for phasing
+
+Signals uses some heuristics to try and pick out the most informative
+cells to use for phasing each chromosome. The first step is that signals
+does some global phasing using all cells and then calls haplotype
+specific copy number using this global phasing. Then in a second pass
+signals attempts to find a subset of cells that will be most informative
+for phasing. Steps are as follows:
+
+For each chromosome separately:
+
+1.  Clustering is run on that chromosome’s allele-specific CN, using the
+    state_BAF (or field) values, with minimum cluster size = min_cells,
+    default = 8.
+2.  For each cluster, several summaries are computed on that chromosome:
+    - propA: proportion of bins with allelic imbalance
+    - propModestate: proportions of bins with total copy number state ==
+      modal state
+    - propLOH: proportion of bins which are LOH
+    - ncells: total number of cells in the cluster  
+3.  Clusters are ordered by (propA, propModestate, ncells, propLOH, n)
+    in descending order.
+4.  The top cluster for that chromosome is chosen, this prioritises
+    clusters with the highest allelic imbalance and if there is a tie
+    this is followed by clusters where copy number is most consistent
+    across the chromosome.
+5.  The cell_ids in that cluster become the phasing cells for that
+    chromosome.
