@@ -24,6 +24,11 @@ singularity exec --bind=/data1 --bind=/home \
 
 Docker file for latest signals is automatically pushed to [Dockerhub](https://hub.docker.com/r/marcjwilliams1/signals).
 
+## Phasing
+For a guide on how to fix certain issues with phasing that result in poor copy number calls, see the `phasing` directory.
+
+## Versions
+
 ### v0.3.1
 Make mappability optional
 
