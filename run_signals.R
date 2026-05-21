@@ -480,6 +480,7 @@ extra_qc_annotations <- function(res){
 #' - `heatmapraw`: File path to save the raw copy and BAF heatmaps.
 #' - `maxcellsplotting`: Maximum number of cells to plot in heatmaps.
 #' - `mappability`: Optional numeric threshold for filtering bins by mappability (only bins with map > this value are kept). Default `NULL` (no filter).
+#' - `quality_filter`: Optional numeric threshold for filtering bins by quality (only bins with quality > this value are kept). Default 0.75.
 #'
 #' @details
 #' The function begins by reading in copy number data, QC metrics, and haplotype data, optionally filtering the cell list and applying masking of bins. 
@@ -494,7 +495,8 @@ run_signals <- function(args){
   
   cndata <- read_copynumber_dlp(cnpaths = args$hmmcopyreads,
                                 metricspaths = args$hmmcopyqc,
-                                mappability = args$mappability)
+                                mappability = args$mappability,
+                                quality_filter = args$quality_filter)
   cell_ids <- unique(cndata$metrics$cell_id)
   message(paste0("Number of cells: ", length(cell_ids)))
   message(paste0("Number of bins: ", dim(distinct(cndata$cn, chr, start))[1]))
@@ -816,6 +818,8 @@ main <- function(){
                       help="List of cells in a text file, one cell_id per row, no header. Only use this subset of cells.")
   parser$add_argument("--mappability", default=NULL, type="double",
                       help="Mappability threshold; only bins with map > this value are kept. Default NULL (no filter).")
+  parser$add_argument("--quality_filter", default=0.75, type="double",
+                      help="Quality filter threshold; only bins with quality > this value are kept. Default 0.75.")
   args <- parser$parse_args()
   
   print(args)
