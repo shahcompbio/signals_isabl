@@ -29,6 +29,9 @@ For a guide on how to fix certain issues with phasing that result in poor copy n
 
 ## Versions
 
+### v0.3.2
+Expose quality filter 
+
 ### v0.3.1
 Make mappability optional
 
