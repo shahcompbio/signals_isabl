@@ -27,6 +27,12 @@ Docker file for latest signals is automatically pushed to [Dockerhub](https://hu
 ## Phasing
 For a guide on how to fix certain issues with phasing that result in poor copy number calls, see the `phasing` directory.
 
+For the joint cross-cell phasing added on top of that guide - aimed at regions
+where only one or two cells are non-diploid - see
+[`phasing/phasing-improvements.md`](phasing/phasing-improvements.md). All of it
+is off by default; that document also records which flags are **not**
+recommended and why.
+
 ## Versions
 
 ### v0.3.2
