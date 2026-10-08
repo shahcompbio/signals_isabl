@@ -319,8 +319,9 @@ filter_normal_cells <- function(cn,
 #'   \item{is_tumor_cell}{Logical indicating whether the cell is classified as a tumor cell (`TRUE`) or not (`FALSE`).}
 #' }
 #'
-find_tumor_cells <- function(cn, diploidcutoff = 0.05){
-  cl <- umap_clustering(cn, field = "copy", minPts = 5, umapmetric = "correlation")
+find_tumor_cells <- function(cn, diploidcutoff = 0.05, seed = NULL){
+  cl <- umap_clustering(cn, field = "copy", minPts = 5, umapmetric = "correlation",
+                        seed = seed)
   cn_clones <- consensuscopynumber(cn, cl$clustering)
   tumor_cell <- cn_clones %>% as.data.table(.) %>% 
     .[, list(frac_nondiploid = sum(state != 2) / .N), by = "cell_id"] %>% 
@@ -330,6 +331,552 @@ find_tumor_cells <- function(cn, diploidcutoff = 0.05){
     select(cell_id, frac_nondiploid, clone_id, is_tumor_cell) %>% 
     rename(tumor_clone_id_clustering = clone_id)
   return(tumor_cell)
+}
+
+#' Phase-free imbalance per cell per unit
+#'
+#' Fits a symmetric two-component mixture to each cell's block counts: reads are
+#' Binomial(n, q) or Binomial(n, 1-q) with equal prior, so the unknown block
+#' phase is marginalised out. `q` is the allelic ratio and `lr` the evidence
+#' against balance (q = 0.5).
+#'
+#' Use `lr`, not `q`, to rank cells: a thin cell can reach q = 0.03 on noise.
+#' `lr` accounts for depth.
+#'
+#' Unlike the depth-stratified Tarone score this is ABSOLUTE, not relative to
+#' other cells - which matters on samples where imbalance is common, because
+#' there a relative score compares each imbalanced cell against other imbalanced
+#' cells and reports that nothing stands out.
+phase_free_imbalance <- function(blocks, mincounts = 2, minblocks = 30){
+  mix <- function(a, n, q) sum(log(0.5 * dbinom(a, n, q) + 0.5 * dbinom(a, n, 1 - q)))
+  blocks[totalcounts >= mincounts, {
+    o <- optimize(function(q) -mix(allele0, totalcounts, q), c(0.02, 0.5))
+    .(q = o$minimum, lr = -o$objective - mix(allele0, totalcounts, 0.5), blocks = .N)
+  }, by = .(cell_id, unit)][blocks >= minblocks]
+}
+
+#' Seed the block phasing for the joint optimisation
+#'
+#' Per unit, take the block-level majority of the cell with the most imbalance
+#' evidence; blocks it does not cover fall back to the all-cell majority. The
+#' seed only has to give SOME cell a non-zero weight so the vote can bootstrap -
+#' seeded from mirrored phasing every cell looks balanced after the HMM
+#' discretises, every weight is zero, and the update has nothing to work with.
+seed_phasing <- function(blocks, imb, key = c("chr","start","end","hap_label")){
+  glob <- blocks[, .(s0 = sum(allele0), s1 = sum(allele1)), by = key]
+  glob[, phi := as.integer(s0 >= s1)]
+  glob <- glob[, c(key, "phi"), with = FALSE]
+  best <- imb[order(-lr), .SD[1], by = unit]
+  seeded <- rbindlist(lapply(seq_len(nrow(best)), function(i){
+    x <- blocks[unit == best$unit[i] & cell_id == best$cell_id[i] & totalcounts > 0]
+    x[, phi := as.integer(allele0 > allele1)]
+    x[, c(key, "phi"), with = FALSE] }))
+  rbind(seeded, glob[!seeded, on = key])
+}
+
+#' One joint-optimisation update of the block phases
+#'
+#' With phi_h = 1 meaning "raw allele0 is the A side", the log-likelihood ratio
+#' for phi_h is
+#'
+#'   logLR_h = sum_c (allele0_ch - allele1_ch) * w_cb
+#'
+#' a vote over EVERY cell with no threshold and no cell selection. A cell that
+#' is balanced in bin b contributes exactly zero; a cell holding the opposite
+#' parent has w < 0, so its counts flip sign and it reinforces the vote instead
+#' of cancelling - which is what the previous pooled-majority approach could not
+#' do without explicitly orienting a hand-picked subset.
+#'
+#' The weight takes its SIGN from the per-bin HMM state and its MAGNITUDE from
+#' the cell's phase-free ratio. The HMM's hard Viterbi call over-states
+#' imbalance when overdispersion is high - on the noisier of two test samples it
+#' called 326 of 369 cells imbalanced - and those spurious weights swamp the few
+#' real ones. The phase-free ratio stays near 0.5 for a genuinely balanced cell
+#' whatever the HMM said.
+#'
+#' @return `data.table` of the block key plus `phi` and `llr`; `abs(llr)` is the
+#'   evidence for that block's phase, in log units.
+joint_phase_update <- function(blocks, states, imb, loherror = 0.035,
+                               key = c("chr","start","end","hap_label")){
+  cl <- function(x) pmin(pmax(x, loherror), 1 - loherror)
+  st <- as.data.table(states)[!is.na(A) & !is.na(B) & (A + B) > 0,
+                              .(cell_id, chr, start, sgn = sign(A - B))]
+  im <- imb[, .(cell_id, unit, mag = abs(log(cl(q) / (1 - cl(q)))))]
+  b <- blocks[st, on = .(cell_id, chr, start), nomatch = 0]
+  b <- b[im, on = .(cell_id, unit), nomatch = 0]
+  b[, wt := sgn * mag]
+  b[, .(llr = sum((allele0 - allele1) * wt)), by = key][
+    , phi := as.integer(llr > 0)][]
+}
+
+#' Re-key a phasing list onto the detection units
+#'
+#' The first pass may phase by chromosome while detection runs per arm. In that
+#' case every arm inherits its chromosome's cell choice, which is exactly the
+#' situation being tested: "given the cells signals actually used here, is there
+#' a better set for this arm?"
+#'
+#' @param phasing `hscn$phasing`, keyed by chromosome or by unit.
+#' @param units The unit names detection will use.
+expand_phasing_to_units <- function(phasing, units){
+  stats::setNames(lapply(units, function(u){
+    if (!is.null(phasing[[u]])) phasing[[u]] else phasing[[sub("[pq]$", "", u)]]
+  }), units)
+}
+
+#' Is the installed signals new enough to honour phasebyarm?
+#'
+#' `phasebyarm` is a script-level flag but arm-level phasing is a package
+#' change, and the script is bind-mounted while the package is baked into the
+#' image - so the flag can take effect against an installed package that still
+#' ignores it. In that combination `get_cells_per_chr_local()` keys the cell
+#' list by chromosome while `phase_haplotypes_bychr()` filters on chromosome
+#' arm, nothing matches, and the run dies much later with an opaque
+#' "'no' is of type NULL" from `fifelse()` after the block join returns 0 rows.
+#'
+#' Probed behaviourally rather than by version, so a dev install is judged on
+#' what it does. `ncells_for_clustering = 1` takes the branch that gives every
+#' cell its own clone, so this needs neither uwot nor real data.
+#'
+#' `get_cells_per_chr_local` is internal to signals, so it has to be fetched
+#' from the namespace - calling it unqualified fails with "could not find
+#' function" and would make this report every build as unsupported.
+#'
+#' @param fn The function to probe. Defaults to signals' internal one; injected
+#'   in tests so both a fixed and an old implementation can be exercised.
+phasebyarm_supported <- function(fn = NULL){
+  fail <- function(reason){ out <- FALSE; attr(out, "reason") <- reason; out }
+  if (is.null(fn)){
+    fn <- tryCatch(utils::getFromNamespace("get_cells_per_chr_local", "signals"),
+                   error = function(e) NULL)
+    if (is.null(fn))
+      return(fail("get_cells_per_chr_local not found in the signals namespace"))
+  }
+  ascn <- data.table::data.table(
+    cell_id = rep(c("a", "b"), each = 2), chr = "1",
+    start = c(1, 150000001, 1, 150000001),          # chr1 p and q (hg19 cen ~121.5Mb)
+    end = c(5e5, 150500000, 5e5, 150500000),
+    state = 2L, LOH = "NO", state_BAF = 0.5, balance = 1L)
+  haps <- data.table::copy(ascn)[, `:=`(hap_label = seq_len(.N), allele1 = 7L, allele0 = 2L,
+                                        state = NULL, LOH = NULL, state_BAF = NULL,
+                                        balance = NULL)]
+  cl <- try(suppressMessages(
+    fn(ascn, haps, ncells_for_clustering = 1, phasebyarm = TRUE)), silent = TRUE)
+  if (inherits(cl, "try-error"))
+    return(fail(paste0("probe call errored: ", conditionMessage(attr(cl, "condition")))))
+  if (length(cl) == 0) return(fail("probe returned an empty cell list"))
+  if (!all(grepl("[pq]$", names(cl))))
+    return(fail(paste0("cell list is keyed by [", paste(names(cl), collapse = ", "),
+                       "] rather than by chromosome arm")))
+  TRUE
+}
+
+#' Label rows with the phasing unit
+#'
+#' The unit must match what `phase_haplotypes_bychr()` keys on: the chromosome,
+#' or the chromosome arm when `phasebyarm = TRUE`. Everything downstream - the
+#' imbalance score, the flagging, the re-phasing - works on `unit`, so switching
+#' granularity is one argument rather than a parallel code path.
+#'
+#' @param d A data.frame with `chr` and `start`.
+#' @param by `"chr"` (default) or `"arm"`.
+#' @return `d` as a data.table with a `unit` column.
+add_unit <- function(d, by = c("chr", "arm")){
+  by <- match.arg(by)
+  d <- as.data.table(d)
+  if (by == "arm") d[, unit := paste0(chr, coord_to_arm(chr, start))] else d[, unit := chr]
+  d[]
+}
+
+#' Per-cell, per-unit allelic imbalance from UNPHASED haplotype counts
+#'
+#' Tarone's Z tests whether a cell's per-block allele counts are overdispersed
+#' relative to Binomial(n, 0.5). An allelically imbalanced cell is overdispersed
+#' at the block level regardless of how the blocks are phased, so this detects
+#' imbalance without any phasing, clustering or HMM. Only the ranking within a
+#' chromosome is meaningful - Z is not calibrated as a p-value, because
+#' genome-wide overdispersion inflates the baseline for every cell.
+#'
+#' @param haplotypes Wide-format haplotypes: `cell_id`, `chr`, `hap_label`,
+#'   `allele0`, `allele1`, `totalcounts`.
+#' Z grows with sequencing depth, so raw Z is NOT comparable between cells: a
+#' shallow cell and a deep cell with identical allelic ratios get very different
+#' Z. Each cell is therefore scored against cells of similar depth on the same
+#' chromosome (robust z-score within a depth stratum), and it is `score`, not
+#' `Z`, that should be compared or thresholded.
+#'
+#' @param mincounts Minimum counts for a block to contribute. Blocks with a
+#'   single read carry no dispersion information. Default 2.
+#' @param nstrata Number of depth strata per unit. Default 10.
+#' @param by Phasing unit: `"chr"` (default) or `"arm"`. Scoring per chromosome
+#'   dilutes a cell that is imbalanced over only one arm, which is how a
+#'   chromosome like 4 - p-arm LOH in a cluster of cells, q-arm imbalance in one
+#'   other cell - passes the chromosome-level check while the q arm is phased
+#'   off noise.
+#'
+#' @return A `data.table` with `cell_id`, `unit`, `chr`, `Z`, `counts`,
+#'   `nblocks`, `stratum` and `score`.
+cell_imbalance_Z <- function(haplotypes, mincounts = 2, nstrata = 10, by = c("chr", "arm")){
+  h <- add_unit(haplotypes, by)
+  z <- h[totalcounts >= mincounts,
+    {
+      p <- sum(allele0) / sum(totalcounts)
+      S <- sum((allele0 - totalcounts * p)^2 / (p * (1 - p)))
+      .(Z = (S - sum(totalcounts)) / sqrt(2 * sum(totalcounts * (totalcounts - 1))),
+        counts = sum(totalcounts), nblocks = .N, chr = chr[1])
+    }, by = .(cell_id, unit)][is.finite(Z)]
+  z[, stratum := cut(counts,
+                     breaks = unique(quantile(counts, seq(0, 1, length.out = nstrata + 1))),
+                     include.lowest = TRUE, labels = FALSE), by = unit]
+  # Floor the per-stratum spread at a fraction of the unit-wide spread. A
+  # stratum whose cells happen to have near-identical Z otherwise collapses the
+  # MAD to ~0 and the ratio explodes, letting a cell with no dispersion at all
+  # clear the threshold.
+  z[, mad_unit := mad(Z), by = unit]
+  z[, score := (Z - median(Z)) / pmax(mad(Z), 0.25 * mad_unit, 1e-6), by = .(unit, stratum)]
+  z[, mad_unit := NULL]
+  z[]
+}
+
+#' Pick the cells to phase one unit with
+#'
+#' Only cells whose depth-stratified imbalance score clears `min_score`, capped
+#' at `kmax`. There is deliberately no padding to a minimum count: pooling
+#' near-balanced cells into the vote actively destroys the phasing, so a unit
+#' with no qualifying cell returns none and is left alone rather than re-phased
+#' off noise.
+select_phasing_cells <- function(Zcell, myunit, min_score = 10, kmax = 10){
+  z <- Zcell[unit == myunit][order(-score)]
+  if (nrow(z) == 0) return(character(0))
+  head(z[score >= min_score]$cell_id, kmax)
+}
+
+#' Flag phasing units where the clustering missed the imbalanced cells
+#'
+#' `callHaplotypeSpecificCN` phases each chromosome from an hdbscan cluster, and
+#' `minPts` is floored at `mincells`, so an event carried by only a handful of
+#' cells can never be isolated into its own cluster. When that happens the
+#' chromosome gets phased off read noise in near-balanced cells and every cell's
+#' A/B assignment flips from bin to bin. The signature is that the cells signals
+#' chose rank far below the most imbalanced cells available.
+#'
+#' @param hscn Result of `callHaplotypeSpecificCN` (needs `$phasing`).
+#' @param Zcell Output of `cell_imbalance_Z`.
+#' @param min_score Only flag chromosomes that have a convincingly imbalanced
+#'   cell to begin with. Where no cell stands out from others of similar depth,
+#'   no phasing is recoverable from the data and re-phasing would just fit noise.
+#'   Default 10.
+#' @param min_gap Flag when the best available score exceeds the best chosen
+#'   cell's score by this margin. Default 10.
+#'
+#' `names(hscn$phasing)` are already the units signals phased on - chromosomes,
+#' or arms when `phasebyarm = TRUE` - so this works on either granularity with
+#' no branching, provided `Zcell` was built with the matching `by`.
+#'
+#' @return A `data.table` with one row per unit and a `flagged` column.
+flag_failed_phasing <- function(hscn, Zcell, min_score = 10, min_gap = 10){
+  rbindlist(lapply(names(hscn$phasing), function(cc){
+    z <- Zcell[unit == cc][order(-score)]
+    used <- unique(hscn$phasing[[cc]])
+    zu <- z[cell_id %in% used]
+    if (nrow(z) == 0) return(NULL)
+    data.table(unit = cc,
+               ncells_used = length(used),
+               score_best = z$score[1],
+               score_used_max = if (nrow(zu)) max(zu$score) else NA_real_,
+               best_used_rank = if (nrow(zu)) min(match(zu$cell_id, z$cell_id)) else NA_integer_,
+               n_candidates = z[score >= min_score, .N],
+               ncells = nrow(z))
+  }))[, gap := score_best - pmax(score_used_max, 0)][
+      , flagged := is.finite(gap) & score_best >= min_score & gap >= min_gap][]
+}
+
+#' Put candidate phasing cells into a common orientation
+#'
+#' Which parent a cell over-represents is arbitrary and differs between cells:
+#' two cells can both be strongly imbalanced over the same region while
+#' favouring opposite haplotypes. Pooling their raw counts then makes them
+#' cancel rather than reinforce, and the pooled majority becomes a patchwork of
+#' whichever cell happens to dominate locally.
+#'
+#' So before pooling, orient every candidate against the highest-scoring one by
+#' pairwise agreement on shared blocks, and flip those that disagree. Cells that
+#' genuinely carry the opposite parent then contribute constructively instead of
+#' eroding the signal.
+#'
+#' @param hc Haplotype rows for one unit.
+#' @param cells Candidate cell ids, highest score first.
+#' @param key Block key columns.
+#' @return Named integer vector of +1 / -1, one per cell.
+orient_cells <- function(hc, cells, key){
+  sgn <- stats::setNames(rep(1L, length(cells)), cells)
+  if (length(cells) < 2) return(sgn)
+  maj <- function(cc){
+    x <- hc[cell_id == cc & totalcounts >= 2, c(key, "allele0", "allele1"), with = FALSE]
+    x[, m := as.integer(allele0 > allele1)]
+    x[, c(key, "m"), with = FALSE]
+  }
+  ref <- maj(cells[1])
+  for (cc in cells[-1]){
+    j <- merge(ref, maj(cc), by = key, suffixes = c(".r", ".o"))
+    if (nrow(j) < 10) next          # too little overlap to judge; leave as is
+    if (mean(j$m.r == j$m.o) < 0.5) sgn[cc] <- -1L
+  }
+  sgn
+}
+
+#' Rebuild haplotype block phasing for the flagged units
+#'
+#' Unflagged units keep signals' own phase labels verbatim, so they
+#' reproduce the original run exactly. Flagged units are re-phased from the
+#' most imbalanced cells, with a fallback to all-cell pooling for blocks those
+#' cells happen not to cover - `phase_haplotypes_bychr` omits uncovered blocks
+#' entirely, and `format_haplotypes` then drops them from *every* cell, so
+#' without the fallback a small phasing set silently discards a large share of
+#' the chromosome's counts.
+#'
+#' @param by Phasing unit, matching the `by` used for `Zcell`.
+#' @return List with `phased_haplotypes` (pass to `callHaplotypeSpecificCN`),
+#'   `cells` (named list of the cells used per re-phased unit) and `rephased`.
+rebuild_phasing <- function(hscn, haplotypes, Zcell, flagged,
+                            min_score = 10, kmax = 10, by = c("chr", "arm")){
+  by <- match.arg(by)
+  key <- c("chr", "start", "end", "hap_label")
+  haps <- add_unit(haplotypes, by)
+  newrows <- list(); used <- list()
+  for (cc in flagged){
+    cells <- select_phasing_cells(Zcell, cc, min_score, kmax)
+    if (length(cells) == 0){
+      message(paste0("  ", cc, ": no cell clears the imbalance threshold, ",
+                     "keeping the original phasing"))
+      next
+    }
+    hc <- haps[unit == cc]
+    sgn <- orient_cells(hc, cells, key)
+    sub <- hc[cell_id %in% cells][, s := sgn[cell_id]][
+      , .(a0 = sum(data.table::fifelse(s > 0L, allele0, allele1)),
+          a1 = sum(data.table::fifelse(s > 0L, allele1, allele0))), by = key]
+    glob <- hc[, .(a0 = sum(allele0), a1 = sum(allele1)), by = key]
+    if (any(sgn < 0L))
+      message(paste0("  ", cc, ": flipped ", sum(sgn < 0L), " of ", length(cells),
+                     " phasing cells into a common orientation"))
+    ph <- rbind(sub, glob[!sub, on = key])
+    newrows[[cc]] <- ph[, .(chr, start, end, hap_label,
+                            phase = fifelse(a0 < a1, "allele0", "allele1"))]
+    used[[cc]] <- cells
+    message(paste0("  ", cc, ": re-phased from ", length(cells), " cells, ",
+                   nrow(ph), " blocks (", nrow(sub), " covered by those cells)"))
+  }
+  # Units we did not actually re-phase keep signals' own labels verbatim, so
+  # they reproduce the original run exactly. Exclude by UNIT, not by chr: with
+  # arms, `rephased` holds "4q" while haplotype_phasing only has chr, so
+  # excluding on chr would keep the 4q rows as well and duplicate them.
+  rephased <- names(newrows)
+  base <- add_unit(hscn$haplotype_phasing, by)[!unit %in% rephased,
+                                               c(key, "phase"), with = FALSE]
+  list(phased_haplotypes = as.data.frame(rbind(base, rbindlist(newrows))),
+       cells = used, rephased = rephased)
+}
+
+#' Minimum-breakpoint orientation for one cell on one chromosome
+#'
+#' Which allele is called A and which is B is an arbitrary label on two otherwise
+#' unidentifiable sets of haplotype blocks. Swapping the label within a set of
+#' bins leaves the emission likelihood *exactly* unchanged, because signals'
+#' emission probabilities are symmetric: p(B) + p(state - B) = 1 for every state
+#' and every B, so dbetabinom(b, n, p) == dbetabinom(n - b, n, 1 - p). The label
+#' is therefore free to choose, and the only thing that distinguishes one choice
+#' from another is how many transitions it implies.
+#'
+#' Two rules, applied in order:
+#'  1. Within a run of constant total copy number the orientation is held fixed
+#'     (`pmax`/`pmin`). A phase switch inside a segment - `2|1` to `1|2` at
+#'     constant total 3 - is not identifiable from a single cell: it is the same
+#'     model with the labels of the second part swapped. So it is never emitted.
+#'  2. Across segment boundaries the relative orientation is chosen to minimise
+#'     the number of *allele-specific* breakpoints, counting which alleles change
+#'     rather than by how much. `2|1` -> `0|1` changes only A and costs 1;
+#'     `2|1` -> `1|0` changes both and costs 2, so the former is preferred.
+#'     Exact, by dynamic programming over two orientations per segment.
+#'
+#' @param state Integer vector of total copy number, in genomic order.
+#' @param A,B Integer vectors of allele-specific copy number, in genomic order.
+#' @return List with relabelled `A` and `B`.
+relabel_min_breakpoints <- function(state, A, B, free = TRUE){
+  n <- length(state)
+  free <- rep_len(free, n)
+  seg <- data.table::rleid(state)
+  ns <- max(seg)
+  # Decide free/pinned per COPY-NUMBER SEGMENT, by majority of its bins, and
+  # mirror whole segments. Mirroring per bin against a scattered free set
+  # forces some bins to A >= B while their pinned neighbours keep B > A, so
+  # every free/pinned boundary becomes an A|B flip: on chr1q that produced 93
+  # flips in a cell, all 93 of them sitting exactly on such a boundary.
+  segfree <- vapply(seq_len(ns), function(j) mean(free[seg == j]) > 0.5, logical(1))
+  mirrorable <- segfree[seg]
+  Am <- ifelse(mirrorable, pmax(A, B), A)
+  Bm <- ifelse(mirrorable, pmin(A, B), B)
+  if (ns > 1 && any(segfree)){
+    first_idx <- match(seq_len(ns), seg)
+    last_idx  <- n - match(seq_len(ns), rev(seg)) + 1L
+    av <- function(i, s) if (s == 1L) Am[i] else Bm[i]
+    bv <- function(i, s) if (s == 1L) Bm[i] else Am[i]
+    allowed <- function(j) if (segfree[j]) 1:2 else 1L
+    dp <- matrix(Inf, ns, 2); bk <- matrix(1L, ns, 2)
+    dp[1, allowed(1)] <- 0
+    for (j in 2:ns){
+      for (s in allowed(j)){
+        opts <- vapply(allowed(j - 1L), function(sp)
+          dp[j - 1L, sp] + (av(last_idx[j-1L], sp) != av(first_idx[j], s)) +
+                            (bv(last_idx[j-1L], sp) != bv(first_idx[j], s)),
+          numeric(1))
+        dp[j, s] <- min(opts); bk[j, s] <- allowed(j - 1L)[which.min(opts)]
+      }
+    }
+    orient <- integer(ns); orient[ns] <- which.min(dp[ns, ])
+    for (j in ns:2) orient[j - 1L] <- bk[j, orient[j]]
+    flip <- (orient == 2L)[seg]
+    out <- list(A = ifelse(flip, Bm, Am), B = ifelse(flip, Am, Bm))
+    # A global flip has identical cost and no meaning, so fix it by convention -
+    # but only when nothing is pinned, since a pinned segment defines the frame.
+    if (all(segfree)){
+      big <- which.max(tabulate(seg, ns))
+      if (sum(out$B[seg == big]) > sum(out$A[seg == big]))
+        out <- list(A = out$B, B = out$A)
+    }
+    return(out)
+  }
+  list(A = Am, B = Bm)
+}
+
+#' Enforce the relabelling invariant across an hscn object
+#'
+#' `state_AS_phased` should differ from `state_AS` only where cross-cell evidence
+#' actually pins the phase. Where it does not, the difference between the two
+#' columns is accumulated noise that reads as real allelic switching. This walks
+#' every (cell, chromosome) whose phase has no *external* support - no other cell
+#' on that chromosome carries detectable allelic imbalance - and replaces the
+#' labelling with the minimum-breakpoint one.
+#'
+#' A cell that is itself the only support for a chromosome counts as unsupported:
+#' its own consistency there is circular, since the phasing was derived from it.
+#'
+#' Allele counts are swapped alongside the calls so that the returned table stays
+#' internally consistent (BAF agrees with the called states). Note this makes the
+#' per-cell BAF-vs-expected comparison uninformative for relabelled rows - but
+#' that comparison is a function of the labelling anyway, so it was never
+#' evidence about the copy number call. Use the labelling-invariant imbalance
+#' score from [cell_imbalance_Z()] for that.
+#'
+#' @param hscn Result of `callHaplotypeSpecificCN`.
+#' @param Zcell Output of [cell_imbalance_Z()].
+#' @param min_score Imbalance score above which a cell counts as supporting the
+#'   phase of its chromosome. Default 10.
+#' @return The `hscn` object with `data` relabelled and a logical
+#'   `phase_relabelled` column marking the affected rows.
+relabel_unsupported_phase <- function(hscn, Zcell = NULL, min_score = 10,
+                                     by = c("chr", "arm"), free_bins = NULL){
+  by <- match.arg(by)
+  d <- data.table::as.data.table(hscn$data)
+  stopifnot(all(c("cell_id","chr","start","state","A","B") %in% names(d)))
+  d <- d[order(cell_id, chr, start)]
+
+  # `free_bins` (chr, start) lets the caller say directly which bins have an
+  # undetermined phase. The joint optimisation supplies it from per-block |llr|,
+  # which is the actual evidence; the older path derives it from a per-cell
+  # score threshold, which is a proxy.
+  if (!is.null(free_bins)){
+    d <- add_unit(d, by)
+    fb <- unique(as.data.table(free_bins)[, .(chr, start)])[, free := TRUE]
+    d[, free := FALSE][fb, on = .(chr, start), free := TRUE]
+    return(relabel_core(d, hscn, by))
+  }
+
+  # Support is evaluated per UNIT and passed to the DP as a per-bin flag, so a
+  # chromosome with one supported arm still gets its unsupported arm relabelled.
+  # Being conservative here (whole chromosome free or not) meant a single
+  # supported arm blocked relabelling of the other one entirely.
+  sup <- unique(Zcell[score >= min_score, .(cell_id, unit)])
+  # deliberately NOT named `nsup`: data.table resolves a bare symbol in `i`
+  # against the target's own columns first, so a join table sharing a column
+  # name with `d` can silently be read as that column instead
+  nsup_tbl <- sup[, .(nsup = .N), by = unit]
+  d <- add_unit(d, by)
+  d[, nsup := 0L][nsup_tbl, on = "unit", nsup := i.nsup]
+  d[, is_sup := FALSE][sup, on = .(cell_id, unit), is_sup := TRUE]
+  # A unit absent from Zcell has no haplotype data at all, which is not the same
+  # as having data that nothing supports - there is nothing to phase and nothing
+  # to relabel, so pin it. Acrocentric p-arms are the case in point: 14p has
+  # bins in the CN table and zero haplotype counts, and relabelling them just
+  # introduced a label break at the 14p/14q junction in every cell.
+  units_with_data <- unique(Zcell$unit)
+  d[, has_data := unit %in% units_with_data]
+  # free when the unit has data and no OTHER cell supports its phase
+  d[, free := has_data & (nsup - as.integer(is_sup)) == 0L]
+  return(relabel_core(d, hscn, by))
+}
+
+#' Apply the minimum-breakpoint relabelling given a per-bin `free` flag
+relabel_core <- function(d, hscn, by){
+  runs <- function(x) sum(x != data.table::shift(x, fill = ""), na.rm = TRUE)
+  before <- d[free == TRUE, .(n = runs(state_AS_phased)), by = .(cell_id, chr)][, sum(n)]
+
+  d[, B0 := B]
+  d[!is.na(A) & !is.na(B) & !is.na(state),
+    c("A", "B") := relabel_min_breakpoints(state, A, B, free), by = .(cell_id, chr)]
+
+  # A run of bins with no haplotype counts carries no evidence, and its A/B
+  # values were filled from neighbours by `fillmissing` anyway. Left alone they
+  # keep whatever orientation the HMM emitted, which need not match the segment
+  # they adjoin - 13p is 36 count-free bins whose labels disagreed with 13q
+  # across the centromere, costing one segment in 72 cells.
+  #
+  # This MUST run after the DP: done before, the DP then re-orients the free
+  # segments and strands the count-free bins it had just been matched to.
+  # Invents nothing - there is no data in these bins either way.
+  if ("totalcounts" %in% names(d)){
+    d[, informative := !is.na(totalcounts) & totalcounts > 0]
+    d[, c("A", "B") := {
+      if (any(informative) && any(!informative)){
+        idx <- which(informative)
+        nearest <- idx[max.col(-abs(outer(seq_len(.N), idx, "-")), ties.method = "first")]
+        # Align the ORIENTATION of a count-free bin to its nearest informative
+        # neighbour by swapping its own A and B - do not copy the neighbour's
+        # values. Copying them took A/B from a bin with a different total copy
+        # number, which broke A + B == state (2484 bins on the 725-cell sample,
+        # e.g. state 2 receiving A=4,B=1 from a state-5 neighbour). A swap
+        # preserves the bin's own total by construction.
+        maj_nb <- sign(A[nearest] - B[nearest])
+        maj_me <- sign(A - B)
+        needswap <- !informative & maj_nb != 0 & maj_me != 0 & maj_nb != maj_me
+        needswap[is.na(needswap)] <- FALSE
+        .(ifelse(needswap, B, A), ifelse(needswap, A, B))
+      } else .(A, B)
+    }, by = .(cell_id, chr)]
+    d[, informative := NULL]
+  }
+
+  d[, swapped := free & !is.na(B) & !is.na(B0) & B != B0]
+
+  if (all(c("alleleA", "alleleB") %in% names(d))){
+    d[swapped == TRUE, c("alleleA", "alleleB") := .(alleleB, alleleA)]
+    # keep NA as NA rather than turning an empty bin into NaN
+    if ("totalcounts" %in% names(d))
+      d[, BAF := data.table::fifelse(is.na(totalcounts) | totalcounts == 0,
+                                     NA_real_, alleleB / totalcounts)]
+  }
+
+  d <- add_states(d)
+  after <- d[free == TRUE, .(n = runs(state_AS_phased)), by = .(cell_id, chr)][, sum(n)]
+  message(paste0("Relabelled ", d[free == TRUE, uniqueN(paste(cell_id, chr))],
+                 " (cell, chromosome) pairs with no external phase support; ",
+                 "A/B runs ", before, " -> ", after,
+                 " (", d[, sum(swapped, na.rm = TRUE)], " bins relabelled)"))
+  d[, phase_relabelled := free]
+  drop <- intersect(c("unit","nsup","is_sup","has_data","free","B0","swapped"), names(d))
+  if (length(drop)) d[, (drop) := NULL]
+  hscn$data <- as.data.frame(d)
+  hscn
 }
 
 #' Call Haplotype-Specific Copy Number (HSCN)
@@ -369,8 +916,13 @@ callhscn <- function(cn,
                      frachaps = 0.8,
                      selftransitionprob = 0.95,
                      chr_cell_list = NULL,
+                     phased_haplotypes = NULL,
                      ncores = 1,
-                     female = TRUE){
+                     female = TRUE,
+                     seed = NULL,
+                     viterbiver = "cpp",
+                     phasebyarm = FALSE,
+                     allele_aware = FALSE){
 
   cn <- as.data.table(cn)
   qc <- as.data.table(qc)
@@ -380,7 +932,7 @@ callhscn <- function(cn,
     message(paste0("Number of cells: ", length(unique(cn$cell_id))))
   } else if (filternormalcells == TRUE){
     message(paste0("Number of cells (pre filtering for normal cells): ", length(unique(cn$cell_id))))
-    x <- find_tumor_cells(cn, diploidcutoff)
+    x <- find_tumor_cells(cn, diploidcutoff, seed = seed)
     cells_to_keep <- x[is_tumor_cell == TRUE]$cell_id
     cn <- cn[cell_id %in% cells_to_keep]
     qc <- qc[cell_id %in% cells_to_keep]
@@ -408,10 +960,15 @@ callhscn <- function(cn,
                                   selftransitionprob = selftransitionprob,
                                   likelihood = "auto",
                                   mincells = mincells,
-                                  cluster_per_chr = TRUE, 
+                                  cluster_per_chr = TRUE,
                                   chr_cell_list = chr_cell_list,
+                                  phased_haplotypes = phased_haplotypes,
                                   ncores = ncores,
-                                  female = female)
+                                  female = female,
+                                  seed = seed,
+                                  viterbiver = viterbiver,
+                                  phasebyarm = phasebyarm,
+                                  allele_aware = allele_aware)
   
   #add library and sample IDs to qc
   qc$sample_id <- unlist(signals:::get_library_labels(qc$cell_id, idx=1))
@@ -542,6 +1099,18 @@ run_signals <- function(args){
     female <- FALSE
   }
   
+  if (isTRUE(args$phasebyarm)){
+    supported <- phasebyarm_supported()
+    if (!isTRUE(supported)){
+      stop("--phasebyarm requires a signals build in which get_cells_per_chr_local() ",
+           "keys the cell list by chromosome arm (>= 0.17.0), otherwise the cell list ",
+           "and the phasing filter disagree and the phasing table comes back empty.\n",
+           "  installed signals: ", as.character(utils::packageVersion("signals")), "\n",
+           "  probe result:      ", attr(supported, "reason"), "\n",
+           "Rebuild the image, or drop --phasebyarm.", call. = FALSE)
+    }
+  }
+
   message("Process chr_cell_list if provided")
   chr_cell_list_processed <- NULL
   if (!is.null(args$chr_cell_list)){
@@ -588,9 +1157,179 @@ run_signals <- function(args){
                   global_phasing_for_balanced = global_phasing_for_balanced,
                   selftransitionprob = args$selftransitionprob,
                   chr_cell_list = chr_cell_list_processed,
-                  female = female)
+                  female = female,
+                  seed = args$seed,
+                  viterbiver = args$viterbiver,
+                  phasebyarm = args$phasebyarm,
+                  allele_aware = args$allele_aware)
+
+  # Phasing unit, needed by both phasing paths and by the relabelling that
+  # follows them - defined here rather than inside a branch.
+  unit_by <- args$rephase_unit
+
+  # Joint cross-cell optimisation of the block phases (roadmap C2). Replaces
+  # the detect-flag-rebuild path entirely: no score threshold, no cell
+  # selection, no orientation forcing. Every cell votes, weighted by its own
+  # local imbalance, so cells carrying opposite parents reinforce rather than
+  # cancel, and |llr| per block is the confidence.
+  if (isTRUE(args$joint_phasing) && is.null(chr_cell_list_processed)){
+    key <- c("chr","start","end","hap_label")
+    haps_used <- add_unit(as.data.table(haplotypes)[cell_id %in% unique(res$data$cell_id)],
+                          args$rephase_unit)
+    message("Fitting phase-free imbalance per cell per unit...")
+    imb <- phase_free_imbalance(haps_used)
+    message(paste0("  ", nrow(imb), " (cell, unit) pairs; ",
+                   imb[lr > 100, .N], " with strong imbalance evidence"))
+    phi <- seed_phasing(haps_used, imb, key)
+    prev <- NULL
+    for (it in seq_len(args$joint_iters)){
+      message(paste0("Joint phasing iteration ", it, " of ", args$joint_iters, "..."))
+      res_it <- callhscn(cndata$cn, cndata$metrics, haplotypes,
+                         frachaps = 0.8, maskedbins = maskedbins,
+                         mincells = args$mincells, diploidcutoff = args$diploidcutoff,
+                         ncores = args$ncores, filternormalcells = args$filternormalcells,
+                         chrs_for_global_phasing = chrs_for_global_phasing,
+                         global_phasing_for_balanced = global_phasing_for_balanced,
+                         selftransitionprob = args$selftransitionprob,
+                         phased_haplotypes = as.data.frame(phi[, c(key, "phi"), with = FALSE][
+                           , .(chr, start, end, hap_label,
+                               phase = fifelse(phi == 1L, "allele1", "allele0"))]),
+                         female = female, seed = args$seed,
+                         viterbiver = args$viterbiver, phasebyarm = args$phasebyarm,
+                         allele_aware = args$allele_aware)
+      upd <- joint_phase_update(haps_used, res_it$data, imb, loherror = res_it$loherror, key)
+      if (!is.null(prev)){
+        chg <- merge(prev[, c(key, "phi"), with = FALSE],
+                     upd[, c(key, "phi"), with = FALSE], by = key)
+        message(paste0("  blocks flipped since last iteration: ",
+                       chg[phi.x != phi.y, .N], " of ", nrow(chg)))
+        if (chg[phi.x != phi.y, .N] == 0) { res <- res_it; prev <- upd; break }
+      }
+      prev <- upd
+      phi <- rbind(upd[, c(key, "phi"), with = FALSE],
+                   seed_phasing(haps_used, imb, key)[!upd, on = key][, c(key,"phi"), with=FALSE])
+      res <- res_it
+    }
+    # callHaplotypeSpecificCN returns phasing = NULL whenever phased_haplotypes
+    # is supplied, and plot_clusters_used_for_phasing() iterates names() of it -
+    # an empty list reaches cowplot::plot_grid(plotlist = list()) and kills the
+    # run at the QC-plot stage, AFTER the inference and BEFORE the csv is
+    # written. C2 has no "cells used for phasing" (every cell votes), so report
+    # the cells carrying the most imbalance evidence in each unit.
+    keep <- unique(res$data$cell_id)
+    res$phasing <- stats::setNames(
+      lapply(sort(unique(imb$unit)), function(u)
+        head(imb[unit == u & cell_id %in% keep][order(-lr)]$cell_id, 5)),
+      sort(unique(imb$unit)))
+    res$phasing <- res$phasing[lengths(res$phasing) > 0]
+
+    phase_llr <- prev[, .(chr, start, end, hap_label, llr)]
+    res$phase_confidence <- phase_llr[, .(chr, start, end, hap_label, llr,
+                                          abs_llr = abs(llr))]
+    message("Per-unit phase confidence (median |logLR| per block):")
+    pc <- add_unit(prev, args$rephase_unit)[, .(blocks = .N,
+            median_abs_llr = round(median(abs(llr)), 2),
+            frac_determined = round(mean(abs(llr) >= 5), 3)), by = unit]
+    print(pc[order(frac_determined)])
+    if (!is.null(args$rephase_report)) fwrite(pc, args$rephase_report)
+  } else if (isTRUE(args$rephase_by_imbalance) && is.null(chr_cell_list_processed)){
+    message("Checking per-chromosome phasing against unphased allelic imbalance")
+    haps_used <- as.data.table(haplotypes)[cell_id %in% unique(res$data$cell_id)]
+    # Detection granularity is independent of how the first pass clustered.
+    # (unit_by is set above, before either branch.)
+    # Arm-level CLUSTERING is worse - an arm has far fewer bins for UMAP, so the
+    # first-pass cell choice degrades badly - but arm-level DETECTION is what
+    # catches a chromosome like 4, where one arm is phased correctly and the
+    # other is not. So default to a chromosome-level first pass with per-arm
+    # detection, and let the two be set separately.
+    Zcell <- cell_imbalance_Z(haps_used, by = unit_by)
+    res_units <- res
+    res_units$phasing <- expand_phasing_to_units(res$phasing, sort(unique(Zcell$unit)))
+    diag <- flag_failed_phasing(hscn = res_units, Zcell = Zcell,
+                                min_score = args$rephase_min_score,
+                                min_gap = args$rephase_min_gap)
+    print(diag[order(-gap)])
+    if (!is.null(args$rephase_report)){
+      fwrite(diag, args$rephase_report)
+    }
+
+    flagged <- diag[flagged == TRUE]$unit
+    # guard against the column name and the call site drifting apart: reading a
+    # column that does not exist yields NULL, which silently looks like
+    # "nothing to re-phase" and skips the entire second pass
+    stopifnot(length(flagged) == diag[flagged == TRUE, .N])
+    rp <- if (length(flagged) > 0){
+      message(paste0("Re-phasing ", length(flagged), " ",
+                     ifelse(unit_by == "arm", "arm(s): ", "chromosome(s): "),
+                     paste(flagged, collapse = ", ")))
+      rebuild_phasing(res, haps_used, Zcell, flagged,
+                      min_score = args$rephase_min_score,
+                      kmax = args$rephase_maxcells,
+                      by = unit_by)
+    } else NULL
+
+    if (is.null(rp) || length(rp$rephased) == 0){
+      message("No chromosome needs re-phasing, keeping the original phasing")
+    } else {
+      res_rp <- callhscn(cndata$cn,
+                         cndata$metrics,
+                         haplotypes,
+                         frachaps = 0.8,
+                         maskedbins = maskedbins,
+                         mincells = args$mincells,
+                         diploidcutoff = args$diploidcutoff,
+                         ncores = args$ncores,
+                         filternormalcells = args$filternormalcells,
+                         chrs_for_global_phasing = chrs_for_global_phasing,
+                         global_phasing_for_balanced = global_phasing_for_balanced,
+                         selftransitionprob = args$selftransitionprob,
+                         phased_haplotypes = rp$phased_haplotypes,
+                         female = female,
+                         seed = args$seed,
+                         viterbiver = args$viterbiver,
+                         phasebyarm = args$phasebyarm,
+                         allele_aware = args$allele_aware)
+      # callHaplotypeSpecificCN returns phasing = NULL when phased_haplotypes is
+      # supplied; restore it so plot_clusters_used_for_phasing() still works and
+      # reports the cells actually used.
+      res_rp$phasing <- res$phasing
+      for (cc in names(rp$cells)) res_rp$phasing[[cc]] <- rp$cells[[cc]]
+      res_rp$rephasing_diagnostics <- diag
+      res <- res_rp
+    }
+
+  }
+
+  # Where no cross-cell evidence pins the phase, the A/B label is arbitrary:
+  # replace it with the labelling that implies the fewest allele-specific
+  # breakpoints. Likelihood-neutral by construction.
+  #
+  # This sits OUTSIDE the two phasing branches: it previously lived inside the
+  # detect-flag-rebuild branch, so --joint_phasing skipped it entirely and the
+  # unphaseable regions kept their raw flipping.
+  if (isTRUE(args$relabel_unsupported_phase)){
+    if (exists("phase_llr", inherits = FALSE)){
+      # joint path: gate on the actual per-block evidence rather than a proxy
+      # Judge a bin by the FRACTION of its blocks that are individually
+      # determined, not by the summed |logLR|: a sum grows with block count, so
+      # a bin of 30 weak blocks clears any fixed total while none of its blocks
+      # is actually informative.
+      fb <- phase_llr[, .(frac = mean(abs(llr) >= args$phase_llr_min)),
+                      by = .(chr, start)][frac < args$phase_min_frac, .(chr, start)]
+      nb <- phase_llr[, uniqueN(paste(chr, start))]
+      message(paste0("Relabelling bins whose phase is undetermined (<",
+                     round(100 * args$phase_min_frac), "% of blocks reach |logLR| ",
+                     args$phase_llr_min, "): ", nrow(fb), " of ", nb, " bins"))
+      res <- relabel_unsupported_phase(res, by = unit_by, free_bins = fb)
+    } else if (exists("Zcell", inherits = FALSE)){
+      message("Applying the relabelling invariant to unsupported chromosomes")
+      res <- relabel_unsupported_phase(res, Zcell, min_score = args$rephase_min_score,
+                                       by = unit_by)
+    }
+  }
+
   res <- extra_qc_annotations(res)
-  
+
   print(res)
   
   # message("Call allele specific copy number")
@@ -657,19 +1396,36 @@ run_signals <- function(args){
       legend.box.background = element_rect(fill = "white") # get rid of legend panel bg
     )
   
-  g6 <- plot_clusters_used_for_phasing(res) +
+  g6 <- tryCatch(plot_clusters_used_for_phasing(res) +
     theme(
       panel.background = element_rect(fill = "white"), # bg of the panel
       plot.background = element_rect(fill = "white"), # bg of the plot
       legend.background = element_rect(fill = "white"), # get rid of legend bg
       legend.box.background = element_rect(fill = "white") # get rid of legend panel bg
-    )
-  
-  gall <- cowplot::plot_grid(cowplot::plot_grid(g1, g2, align = "h", axis = "tb"), cowplot::plot_grid(g3, g4, g5, ncol = 3), g6, ncol = 1, rel_heights = c(0.25, 0.25, 0.5))
-  
+    ),
+    error = function(e){
+      warning("plot_clusters_used_for_phasing() failed: ", conditionMessage(e),
+              " - continuing without that panel", call. = FALSE)
+      ggplot() + theme_void() })
+
+  # Size the device from the number of phasing panels instead of a fixed 20in.
+  # Phasing by arm roughly doubles the panel count (23 chromosomes -> up to 46
+  # units), and a fixed height simply halves the space each row gets: at 6
+  # columns the phasing grid goes from 4 rows of 2.5in to 7 rows of 1.4in, which
+  # is what squashes the CN/BAF panels.
+  phase_rows <- attr(g6, "phasing_rows")
+  if (is.null(phase_rows)) phase_rows <- 4      # blank fallback panel
+  h_top <- 5                                    # BAF- and variance-per-state
+  h_mid <- 5                                    # the three histograms
+  h_phase <- max(2.5 * phase_rows, 6)
+  gall <- cowplot::plot_grid(
+    cowplot::plot_grid(g1, g2, align = "h", axis = "tb"),
+    cowplot::plot_grid(g3, g4, g5, ncol = 3),
+    g6, ncol = 1, rel_heights = c(h_top, h_mid, h_phase))
+
   cowplot::save_plot(args$qcplot,
                      gall,
-                     base_width = 15, base_height = 20)
+                     base_width = 15, base_height = h_top + h_mid + h_phase)
   
   #filter out cells where BAF and inferred state indicate possible errors
   cell_ids <- unique(res$data$cell_id)
@@ -683,7 +1439,8 @@ run_signals <- function(args){
                         field = "copy", 
                         hscn = FALSE,
                         umapmetric = "correlation",
-                        minPts = round(0.03 * length(cell_ids)))
+                        minPts = round(0.03 * length(cell_ids)),
+                        seed = args$seed)
   
   res$qc_per_cell <- dplyr::left_join(res$qc_per_cell, cl$clustering %>% dplyr::select(cell_id, clone_id), by = "cell_id")
   
@@ -816,6 +1573,41 @@ main <- function(){
                       help="Patient sex, either FEMALE or MALE, this controls what happens with chromosome X")
   parser$add_argument("--cell_list", default=NULL, type="character",
                       help="List of cells in a text file, one cell_id per row, no header. Only use this subset of cells.")
+  parser$add_argument("--rephase_unit", default="chr", type="character",
+                      help="Granularity for detecting and correcting bad phasing: 'chr' (default) or 'arm'. Independent of --phasebyarm, which changes how the FIRST pass clusters. Arm-level clustering is worse (fewer bins per unit for UMAP), so the useful combination is a chromosome-level first pass with --rephase_unit arm, which catches cases like chromosome 4 where one arm phases correctly and the other does not.")
+  parser$add_argument("--phasebyarm", action="store_true", default=FALSE,
+                      help="Phase each chromosome arm separately rather than the whole chromosome. Use where imbalance is confined to one arm: on the test sample chromosome 4 has p-arm LOH in a cluster of cells and q-arm imbalance in a different single cell, so whole-chromosome phasing gets the q arm wrong. Also switches the imbalance detection to per-arm scoring. Requires signals >= 0.17.0.")
+  parser$add_argument("--allele_aware", action="store_true", default=FALSE,
+                      help=paste("Score HMM transitions by how many alleles change",
+                                 "(1[dA!=0] + 1[dB!=0]) instead of a flat matrix over B.",
+                                 "Identical wherever total CN is constant; at a copy number",
+                                 "change a one-allele move is preferred, so 2|1 -> 0|1 beats",
+                                 "2|1 -> 1|0, and 1|1 -> 1|2 is no longer penalised relative",
+                                 "to 1|1 -> 2|1."))
+  parser$add_argument("--viterbiver", default="cpp", type="character",
+                      help="Viterbi implementation: 'cpp' (default) or 'R'. Append _legacy ('cpp_legacy', 'R_legacy') to reproduce the incorrect backtrace used up to signals 0.16.0, which did not return the maximum a posteriori path and emitted spurious single-bin state changes. Requires signals >= 0.17.0.")
+  parser$add_argument("--seed", default=NULL, type="integer",
+                      help="Random seed. Phasing picks which cells phase each chromosome via UMAP + hdbscan and random subsampling, so without a seed two runs on identical input can phase a chromosome differently and return different haplotype-specific states. Set this to make a run reproducible. Requires signals >= 0.16.0.")
+  parser$add_argument("--joint_phasing", action="store_true", default=FALSE,
+                      help="Jointly optimise the block phases with the per-cell states (roadmap C2). Replaces --rephase_by_imbalance: every cell votes weighted by its own local imbalance, with no score threshold and no cell selection, so cells carrying opposite parental haplotypes reinforce rather than cancel. Emits per-block |logLR| as phase confidence.")
+  parser$add_argument("--phase_llr_min", default=5, type="double",
+                      help="Per-BLOCK |logLR| at which a block counts as determined; see --phase_min_frac for how bins are judged. Only used with --joint_phasing. Default 5.")
+  parser$add_argument("--phase_min_frac", default=0.5, type="double",
+                      help="A bin counts as having a determined phase when at least this fraction of its blocks reach |logLR| >= --phase_llr_min. Below it the A/B label is arbitrary and the minimum-breakpoint relabelling applies. Only used with --joint_phasing. Default 0.5.")
+  parser$add_argument("--joint_iters", default=4, type="integer",
+                      help="Maximum joint-phasing iterations; stops early once no block flips. Each iteration is a full HSCN inference. Default 4 (converged in 3 on both test samples).")
+  parser$add_argument("--rephase_by_imbalance", action="store_true", default=FALSE,
+                      help="After the first pass, detect chromosomes where the per-chromosome clustering selected cells with little allelic imbalance, and re-phase those chromosomes from the most imbalanced cells instead. Runs the HSCN inference a second time.")
+  parser$add_argument("--rephase_min_score", default=10, type="double",
+                      help="Minimum depth-stratified imbalance score for a cell to be used for phasing, and for a chromosome to be re-phased at all. Below this the cell is not distinguishable from others of similar sequencing depth, so re-phasing would fit noise. Default 10.")
+  parser$add_argument("--rephase_min_gap", default=10, type="double",
+                      help="Re-phase when the best available imbalance score exceeds the best score among the cells signals chose by this margin. Default 10.")
+  parser$add_argument("--rephase_maxcells", default=10, type="integer",
+                      help="Cap on cells used to re-phase a chromosome. Adding near-balanced cells to the vote degrades the phasing, so keep this small. Default 10.")
+  parser$add_argument("--relabel_unsupported_phase", action="store_true", default=FALSE,
+                      help="For (cell, chromosome) pairs where no other cell carries detectable allelic imbalance, replace the arbitrary A/B labelling with the one implying the fewest allele-specific breakpoints. Likelihood-neutral. Requires --rephase_by_imbalance (it reuses the imbalance scores). Adds a phase_relabelled column to the output.")
+  parser$add_argument("--rephase_report", default=NULL, type="character",
+                      help="Optional csv path for the per-chromosome phasing diagnostics table.")
   parser$add_argument("--mappability", default=NULL, type="double",
                       help="Mappability threshold; only bins with map > this value are kept. Default NULL (no filter).")
   parser$add_argument("--quality_filter", default=0.75, type="double",
