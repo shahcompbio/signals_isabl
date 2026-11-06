@@ -33,6 +33,10 @@ where only one or two cells are non-diploid - see
 is off by default; that document also records which flags are **not**
 recommended and why.
 
+The phasing helpers in `run_signals.R` have their own tests, since they sit
+outside the signals package: `Rscript test-run-signals-functions.R`, inside the
+signals image (it needs the package).
+
 ## Versions
 
 ### v0.3.2
