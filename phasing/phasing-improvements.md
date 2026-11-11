@@ -12,6 +12,11 @@ Validated on two DLP+ samples:
 Everything here is **off by default**; the script's behaviour without new flags
 is unchanged except for the two fixes noted under *Fixes*.
 
+**Requires signals 0.18.0.** The Dockerfile installs signals from its GitHub
+default branch, and this script passes arguments (`allele_aware`, and a working
+`phasebyarm`) that earlier versions reject or ignore. Merge and release signals
+0.18.0 before deploying this.
+
 ---
 
 ## Recommended invocation
@@ -127,8 +132,11 @@ unchanged" the cheap self-transition and gives "A unchanged" no standing:
 the state space is parameterised. Scoring by how many alleles change is
 symmetric in A and B.
 
-Left correctness unchanged on both samples and reduced allele-specific segments
-by 1.3–1.5%. Requires a signals build with the `allele_aware` argument.
+On real data it left correctness unchanged on both samples and reduced
+allele-specific segments by 1.3–1.5%. On simulated events inside an arm (see
+*Validation*) it was never worse than joint phasing alone and better in 7 of 10
+scenarios, mostly short events carried by few cells - but on small bin counts,
+so the benefit is consistent rather than established. Off by default.
 
 ### `--phasebyarm`
 Passes through to signals' own `phasebyarm`. Note this was unusable in signals
@@ -178,8 +186,16 @@ on S1, on opposite-parent pairs specifically:
 
 All 8 disagreements in the relabelled run were opposite-parent pairs reported as
 same-parent — on 1p, 2q, 5q, 9q, 18p, at `|z|` up to 22.6 over 1,345 blocks. The
-otherwise-identical run without relabelling gets all 8 right. S2 agrees: 60% with,
-100% without.
+otherwise-identical run without relabelling gets all 8 right. (A comparable S2
+contrast exists only between runs that also differ in phasing path and signals
+version, so it is not cited here.)
+
+Simulated data with a planted truth confirms it directly: with carriers of
+opposite parents, relabelling gets 50-75% of carrier bins right against 98-100%
+without, and it does so while reporting zero switches, so it looks the cleanest
+of all. The cause is in the code: wherever block phases are not confidently
+determined, it mirrors every cell to `A >= B`, which erases which parent each
+cell gained.
 
 The flags are retained so the result is reproducible, not because they are
 recommended. The principled replacement is to put the same preference inside the
@@ -191,7 +207,50 @@ selection and no orientation forcing. Retained only for reproducing earlier runs
 
 ---
 
-## Known limitation: regions with too little evidence
+## Validation on simulated data
+
+Real data has no ground truth, so the methods were also scored against a planted
+one: real S1 cells everywhere except one arm (10q), whose copy number and allele
+counts were replaced by known events drawn on the real block layout and depth,
+behind a hidden per-block phase, with noise fitted to real diploid data. 150
+cells, two seeds per scenario. Carrier bins called exactly right:
+
+| scenario | original phasing | joint phasing |
+|---|---|---|
+| 1 or 2 cells carry a whole-arm gain | 77-80% | **99-100%** |
+| 5 cells, opposite parents | 74% | **98%** |
+| 20 cells | 99% | 99% |
+| 25-bin focal gain inside the arm | 75-76% | **98-100%** |
+| gain with nested LOH, 2 cells | 77% | **98%** |
+
+Joint phasing got every carrier's parent of origin right in every whole-arm
+scenario. In one scenario (a 10-bin focal gain carried by 2 cells) it got 36 of
+40 event bins right where the original phasing got 40. It also calls slightly
+more false imbalance in balanced cells: 0.136% of their bins against 0.111%,
+averaged over 34 runs of each.
+
+## Known limitations
+
+### Major-allele flips inside an event
+
+Where the major allele changes within an event - a gain whose middle then loses
+the gained copy, truth `2|1 -> 0|1` - every configuration, the original phasing
+included, mirrors the inner stretch for every cell: `2|1 -> 1|0`. Haplotype
+blocks are phased independently of each other, so the reads cannot link that
+stretch to its neighbours, and signals' labelling assumes the major allele is
+one haplotype along the arm. A tie-break across cells is in development.
+
+### Small residual switches with opposite-parent carriers
+
+With carriers of opposite parents, joint phasing leaves about 1% of carrier bins
+with a spurious orientation switch.
+
+### Runtime
+
+Each `--joint_iters` iteration reruns the whole inference, so `--joint_phasing
+--joint_iters 4` costs roughly 4x the runtime of the original.
+
+### Regions with too little evidence
 
 Some regions cannot be phased by any method here, and it is worth being able to
 tell. On S1, chromosome 8 looks wrong on the heatmap in every configuration

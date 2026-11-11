@@ -39,6 +39,15 @@ signals image (it needs the package).
 
 ## Versions
 
+### v0.4.0
+- Joint cross-cell phasing (`--joint_phasing`): every cell votes on every
+  haplotype block, weighted by its own imbalance, fixing poorly phased regions
+  where only one or two cells are non-diploid. Recommended flags, validation and
+  known limitations in [`phasing/phasing-improvements.md`](phasing/phasing-improvements.md)
+- `--seed`, `--rephase_unit`, `--rephase_report`, `--allele_aware`, `--phasebyarm`
+- Requires signals 0.18.0
+- `--relabel_unsupported_phase` is kept for reproducibility but not recommended
+
 ### v0.3.2
 Expose quality filter 
 
