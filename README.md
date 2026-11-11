@@ -27,7 +27,26 @@ Docker file for latest signals is automatically pushed to [Dockerhub](https://hu
 ## Phasing
 For a guide on how to fix certain issues with phasing that result in poor copy number calls, see the `phasing` directory.
 
+For the joint cross-cell phasing added on top of that guide - aimed at regions
+where only one or two cells are non-diploid - see
+[`phasing/phasing-improvements.md`](phasing/phasing-improvements.md). All of it
+is off by default; that document also records which flags are **not**
+recommended and why.
+
+The phasing helpers in `run_signals.R` have their own tests, since they sit
+outside the signals package: `Rscript test-run-signals-functions.R`, inside the
+signals image (it needs the package).
+
 ## Versions
+
+### v0.4.0
+- Joint cross-cell phasing (`--joint_phasing`): every cell votes on every
+  haplotype block, weighted by its own imbalance, fixing poorly phased regions
+  where only one or two cells are non-diploid. Recommended flags, validation and
+  known limitations in [`phasing/phasing-improvements.md`](phasing/phasing-improvements.md)
+- `--seed`, `--rephase_unit`, `--rephase_report`, `--allele_aware`, `--phasebyarm`
+- Requires signals 0.18.0
+- `--relabel_unsupported_phase` is kept for reproducibility but not recommended
 
 ### v0.3.2
 Expose quality filter 
